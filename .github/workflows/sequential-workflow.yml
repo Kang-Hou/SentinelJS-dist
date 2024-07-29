@@ -1,0 +1,130 @@
+name: Sequential Workflow
+
+permissions:
+  contents: write
+  pull-requests: write
+
+on:
+  workflow_dispatch:
+
+jobs:
+  initialize_db:
+    runs-on: ubuntu-latest
+    outputs:
+      table_count: ${{ steps.read_table_count.outputs.TABLE_COUNT }}
+    steps:
+      - name: Trigger start-init-db workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: start-init-db.yml
+          token: ${{ secrets.SENTINEL_TOKEN }}
+
+      - name: Wait for start-init-db to complete
+        uses: fountainhead/action-wait-for-check@v1.2.0
+        with:
+          token: ${{ secrets.SENTINEL_TOKEN }}
+          checkName: initialize
+          ref: ${{ github.sha }}
+          timeoutSeconds: 1800
+          intervalSeconds: 60
+
+      - name: Download table count
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.SENTINEL_TOKEN }}
+          workflow: start-init-db.yml
+          name: table-count
+          path: .
+
+      - name: Read table count
+        id: read_table_count
+        run: |
+          table_count=$(cat table_count.txt)
+          echo "TABLE_COUNT=$table_count" >> $GITHUB_OUTPUT
+
+  generate_matrix:
+    needs: initialize_db
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      trigger_time: ${{ steps.get-current-time.outputs.time }}
+    steps:
+      - name: Get current time
+        id: get-current-time
+        run: echo "time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Generate matrix
+        id: set-matrix
+        run: |
+          table_count=${{ needs.initialize_db.outputs.table_count }}
+          batch_size=250
+          matrix="["
+          start=1
+          while [ $start -le $table_count ]; do
+            if [ $start -ne 1 ]; then
+              matrix="${matrix},"
+            fi
+            matrix="${matrix}${start}"
+            start=$((start + batch_size))
+          done
+          matrix="${matrix}]"
+          echo "matrix=${matrix}" >> $GITHUB_OUTPUT
+
+  process_tables:
+    needs: generate_matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        start_index: ${{ fromJson(needs.generate_matrix.outputs.matrix) }}
+    steps:
+      - name: Trigger process-tables workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: process-tables.yml
+          token: ${{ secrets.SENTINEL_TOKEN }}
+          inputs: |
+            {
+              "start_index": "${{ matrix.start_index }}",
+              "batch_size": "250"
+            }
+
+  save_run_info:
+    needs: [initialize_db, generate_matrix, process_tables]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get process-tables workflow ID
+        id: get-workflow-id
+        run: |
+          workflows=$(gh api /repos/${{ github.repository }}/actions/workflows)
+          workflow_id=$(echo "$workflows" | jq -r '.workflows[] | select(.name == "Process Tables") | .id')
+          echo "WORKFLOW_ID=$workflow_id" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.SENTINEL_TOKEN }}
+
+      - name: Wait for process-tables workflows to start
+        run: sleep 60  # Sleep 60s to wait all process tables run launched before get run ids
+
+      - name: Get run IDs
+        id: get-run-ids
+        run: |
+          matrix_size=$(echo '${{ needs.generate_matrix.outputs.matrix }}' | jq length)
+          workflow_id=${{ steps.get-workflow-id.outputs.WORKFLOW_ID }}
+          trigger_time="${{ needs.generate_matrix.outputs.trigger_time }}"
+          
+          runs=$(gh api "/repos/${{ github.repository }}/actions/workflows/$workflow_id/runs?created=>$trigger_time&per_page=$matrix_size")
+          run_ids=$(echo "$runs" | jq -r '.workflow_runs[].id' | tr '\n' ',' | sed 's/,$//')
+          
+          echo "RUN_IDS=$run_ids" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.SENTINEL_TOKEN }}
+
+      - name: Save run information
+        run: |
+          echo "${{ steps.get-run-ids.outputs.RUN_IDS }}" > run_ids.txt
+          echo "Run IDs: ${{ steps.get-run-ids.outputs.RUN_IDS }}"
+
+      - name: Upload run information
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-info
+          path: run_ids.txt
