@@ -64,8 +64,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.SENTINEL_TOKEN }}
 
   trigger_rerun:
-    needs: check_status
-    if: needs.check_status.outputs.merge_ready == 'false'
+    # needs: check_status
+    # if: needs.check_status.outputs.merge_ready == 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger rerun-failed-jobs workflow
