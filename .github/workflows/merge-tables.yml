@@ -63,20 +63,20 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.SENTINEL_TOKEN }}
 
-  trigger_rerun:
-    # needs: check_status
-    # if: needs.check_status.outputs.merge_ready == 'false'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger rerun-failed-jobs workflow
-        uses: benc-uk/workflow-dispatch@v1
-        with:
-          workflow: rerun-failed-jobs.yml
-          token: ${{ secrets.SENTINEL_TOKEN }}
+  # trigger_rerun:
+  #   needs: check_status
+  #   if: needs.check_status.outputs.merge_ready == 'false'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Trigger rerun-failed-jobs workflow
+  #       uses: benc-uk/workflow-dispatch@v1
+  #       with:
+  #         workflow: rerun-failed-jobs.yml
+  #         token: ${{ secrets.SENTINEL_TOKEN }}
 
   merge_tables:
-    needs: check_status
-    if: needs.check_status.outputs.merge_ready == 'true'
+    # needs: check_status
+    # if: needs.check_status.outputs.merge_ready == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
