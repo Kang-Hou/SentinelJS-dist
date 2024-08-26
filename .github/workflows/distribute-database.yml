@@ -1,0 +1,106 @@
+name: Distribute Database
+on:
+#   schedule:
+#     - cron: '0 0 * * *'  # Runs at 00:00 every day.
+  workflow_dispatch:
+
+jobs:
+  check-times:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run_merge_tables: ${{ steps.check_times.outputs.should_run_merge_tables }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check workflow run times
+        id: check_times
+        run: |
+          # Get the last successful run of merge-tables.yml
+          merge_tables_time=$(gh run list --workflow=merge-tables.yml --status=success --limit=1 --json updatedAt --jq '.[0].updatedAt')
+          
+          # Get the last successful run of distribute-database.yml (current workflow)
+          distribute_database_time=$(gh run list --workflow=distribute-database.yml --status=success --limit=1 --json updatedAt --jq '.[0].updatedAt')
+          
+          # Set default values
+          should_run_merge_tables=false
+          
+          if [ -z "$merge_tables_time" ]; then
+            echo "merge-tables.yml has never run successfully. Aborting the workflow."
+            exit 1
+          elif [ -z "$distribute_database_time" ] || [ "$merge_tables_time" \> "$distribute_database_time" ]; then
+            should_run_merge_tables=true
+          fi
+          
+          echo "should_run_merge_tables=$should_run_merge_tables" >> $GITHUB_OUTPUT
+          
+          echo "merge-tables.yml last run: $merge_tables_time"
+          echo "distribute-database.yml last run: $distribute_database_time"
+          echo "Should run merge-tables: $should_run_merge_tables"
+        env:
+          GITHUB_TOKEN: ${{ secrets.SENTINEL_TOKEN }}
+
+  process-backup:
+    needs: check-times
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Docker Compose
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Start Docker Compose services
+        run: docker compose up -d
+      
+      - name: Download correct artifact
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          github_token: ${{ secrets.SENTINEL_TOKEN }}
+          workflow: ${{ needs.check-times.outputs.should_run_merge_tables == 'true' && 'merge-tables.yml' || 'distribute-database.yml' }}
+          name: sentineldb-backup
+          path: .
+          check_artifacts: true
+          search_artifacts: true
+          if_no_artifact_found: warn
+          workflow_conclusion: success
+      
+      - name: Check if backup exists and import if available
+        run: |
+          if [ -f sentineldb_backup.sql ]; then
+            echo "Backup found. Importing database backup."
+            # Wait for PostgreSQL to be ready
+            docker exec pg_container sh -c 'while ! pg_isready; do sleep 1; done'
+            # Import the backup
+            cat sentineldb_backup.sql | docker exec -i pg_container psql -U sentineljs -d sentineldb
+          else
+            echo "No backup found. Proceeding with existing database."
+          fi
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '21'
+      
+      - name: Clone private repository
+        run: |
+          git clone https://${{ secrets.SENTINEL_TOKEN }}@github.com/Kang-Hou/SentinelDB.git
+      
+      - name: Install dependencies and run script
+        run: |
+          cd SentinelDB
+          npm install
+      
+      - name: Run update
+        run: node SentinelDB/index.js -a
+        
+      - name: Export updated PostgreSQL data
+        run: |
+          docker exec pg_container pg_dump -U sentineljs sentineldb > sentineldb_backup.sql
+      
+      - name: Upload updated database backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentineldb-backup
+          path: sentineldb_backup.sql
+          compression-level: 9
+          retention-days: 30
