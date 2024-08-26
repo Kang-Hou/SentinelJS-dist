@@ -1,0 +1,194 @@
+name: Merge Tables
+
+on:
+  workflow_dispatch:
+
+env:
+  DB_USER: sentineljs
+  DB_NAME: sentineldb
+
+concurrency: 
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check_status:
+    runs-on: ubuntu-latest
+    outputs:
+      merge_ready: ${{ steps.check_runs.outputs.MERGE_READY }}
+    steps:
+      - name: Download run information
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{secrets.SENTINEL_TOKEN}}
+          workflow: sequential-workflow.yml
+          name: run-info
+          path: run-info
+          check_artifacts: true
+          search_artifacts: true
+          if_no_artifact_found: fail
+          workflow_conclusion: success
+
+      - name: Check process_tables status
+        id: check_runs
+        run: |
+          run_ids=$(cat run-info/run_ids.txt)
+          IFS=',' read -ra run_id_array <<< "$run_ids"
+          all_completed=true
+          all_successful=true
+          for run_id in "${run_id_array[@]}"; do
+            run_info=$(gh api /repos/${{ github.repository }}/actions/runs/$run_id)
+            status=$(echo "$run_info" | jq -r '.status')
+            conclusion=$(echo "$run_info" | jq -r '.conclusion')
+            if [ "$status" != "completed" ]; then
+              all_completed=false
+              all_successful=false
+              echo "Run $run_id is not completed (status: $status)"
+              break
+            elif [ "$conclusion" != "success" ]; then
+              all_successful=false
+              echo "Run $run_id failed (conclusion: $conclusion)"
+            fi
+          done
+          if $all_completed && $all_successful; then
+            echo "All runs are completed successfully"
+            echo "MERGE_READY=true" >> $GITHUB_OUTPUT
+          elif $all_completed && ! $all_successful; then
+            echo "All runs are completed but some failed"
+            echo "MERGE_READY=false" >> $GITHUB_OUTPUT
+          else
+            echo "Not all runs are completed. Merge will not proceed."
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.SENTINEL_TOKEN }}
+
+  trigger_rerun:
+    needs: check_status
+    if: needs.check_status.outputs.merge_ready == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger rerun-failed-jobs workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: rerun-failed-jobs.yml
+          token: ${{ secrets.SENTINEL_TOKEN }}
+
+  merge_tables:
+    needs: check_status
+    if: needs.check_status.outputs.merge_ready == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Download run information
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{secrets.SENTINEL_TOKEN}}
+          workflow: sequential-workflow.yml
+          name: run-info
+          path: run-info
+          check_artifacts: true
+          search_artifacts: true
+          if_no_artifact_found: fail
+          workflow_conclusion: success
+
+      - name: Download artifacts and merge tables
+        run: |
+          echo "Starting download and merge process"
+          
+          # Check if run-info/run_ids.txt exists
+          if [ ! -f run-info/run_ids.txt ]; then
+            echo "Error: run-info/run_ids.txt does not exist"
+            exit 1
+          fi
+          
+          run_ids=$(cat run-info/run_ids.txt)
+          echo "Run IDs: $run_ids"
+          
+          IFS=',' read -ra run_id_array <<< "$run_ids"
+          for run_id in "${run_id_array[@]}"; do
+            echo "Downloading artifacts for run ID: $run_id"
+            if gh run download $run_id; then
+              echo "Successfully downloaded artifacts for run ID: $run_id"
+            else
+              echo "Failed to download artifacts for run ID: $run_id"
+              exit 1
+            fi
+          done
+
+          for sql_file in $(find . -name "updated_table_*.sql"); do
+            echo "Importing data from $sql_file"
+            if docker exec -i pg_container psql -U ${{ env.DB_USER }} -d ${{ env.DB_NAME }} < "$sql_file"; then
+              echo "Successfully imported data from $sql_file"
+            else
+              echo "Failed to import data from $sql_file"
+              echo "Docker container status:"
+              docker ps
+              echo "PostgreSQL logs:"
+              docker logs pg_container
+              exit 1
+            fi
+          done
+          
+          echo "Finished download and merge process"
+        env:
+          GITHUB_TOKEN: ${{ secrets.SENTINEL_TOKEN }}
+
+      # - name: Download sentineldb-executable
+      #   uses: dawidd6/action-download-artifact@v6
+      #   with:
+      #     github_token: ${{secrets.SENTINEL_TOKEN}}
+      #     workflow: build_sea.yml
+      #     name: sentineldb-executable
+      #     repo: Kang-Hou/SentinelDB
+      #     path: .
+      #     check_artifacts: true
+      #     search_artifacts: true
+      #     if_no_artifact_found: fail
+      #     workflow_conclusion: success
+
+      # - name: Make executable runnable
+      #   run: chmod +x ./sentineldb
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '21'
+          
+      - name: Clone private repository
+        run: |
+          git clone https://${{ secrets.SENTINEL_TOKEN }}@github.com/Kang-Hou/SentinelDB.git
+        
+      - name: Install dependencies and run script
+        run: |
+          cd SentinelDB
+          npm install
+    
+      - name: Merge Tables
+        run: |
+          if ! node SentinelDB/index.js -d; then
+            echo "Failed to merge tables"
+            exit 1
+          fi
+
+      - name: Export entire updated database
+        run: |
+          if ! docker exec pg_container pg_dump -U ${{ env.DB_USER }} ${{ env.DB_NAME }} > sentineldb_backup.sql; then
+            echo "Failed to export updated database"
+            exit 1
+          fi
+
+      - name: Upload updated database backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentineldb-backup
+          path: sentineldb_backup.sql
+          compression-level: 9

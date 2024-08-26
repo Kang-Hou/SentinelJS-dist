@@ -1,0 +1,87 @@
+name: Start Initializing Database
+
+on:
+  workflow_dispatch:
+
+env:
+  DB_USER: sentineljs
+  DB_NAME: sentineldb
+
+jobs:
+  initialize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      # - name: Download sentineldb-executable
+      #   uses: dawidd6/action-download-artifact@v6
+      #   with:
+      #     github_token: ${{secrets.SENTINEL_TOKEN}}
+      #     workflow: build_sea.yml
+      #     name: sentineldb-executable
+      #     repo: Kang-Hou/SentinelDB
+      #     path: .
+      #     check_artifacts: true
+      #     search_artifacts: true
+      #     if_no_artifact_found: fail
+      #     workflow_conclusion: success
+
+      # - name: Make executable runnable
+      #   run: chmod +x ./sentineldb
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '21'
+          
+      - name: Clone private repository
+        run: |
+          git clone https://${{ secrets.SENTINEL_TOKEN }}@github.com/Kang-Hou/SentinelDB.git
+        
+      - name: Install dependencies and run script
+        run: |
+          cd SentinelDB
+          npm install
+
+      - name: Build and Split (-b operation)
+        run: |
+          echo "Executing build and split operation"
+          if ! node SentinelDB/index.js -b; then
+            echo "Failed to execute build and split operation"
+            exit 1
+          fi
+
+      - name: Export initial database
+        run: |
+          if ! docker exec pg_container pg_dump -U ${{ env.DB_USER }} ${{ env.DB_NAME }} > initial_db.sql; then
+            echo "Failed to export initial database"
+            exit 1
+          fi
+
+      - name: Get table count and save to file
+        run: |
+          table_count=$(node SentinelDB/index.js --get-table-count)
+          echo $table_count > table_count.txt
+          
+      - name: Upload initial database
+        uses: actions/upload-artifact@v4
+        with:
+          name: initial-database
+          path: initial_db.sql
+          compression-level: 9
+          retention-days: 10
+          
+      - name: Upload table count
+        uses: actions/upload-artifact@v4
+        with:
+          name: table-count
+          path: table_count.txt
+          compression-level: 9
+          retention-days: 10

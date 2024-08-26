@@ -1,0 +1,52 @@
+name: Rerun Failed Jobs
+on:
+  workflow_dispatch:
+jobs:
+  rerun_failed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        
+      - name: Download run information
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{secrets.SENTINEL_TOKEN}}
+          workflow: sequential-workflow.yml
+          name: run-info
+          path: run-info
+          check_artifacts: true
+          search_artifacts: true
+          if_no_artifact_found: fail
+          workflow_conclusion: success
+
+      - name: Rerun failed jobs
+        id: rerun
+        run: |
+          run_ids=$(cat run-info/run_ids.txt)
+          IFS=',' read -ra run_id_array <<< "$run_ids"
+          rerun_triggered=false
+          for run_id in "${run_id_array[@]}"; do
+            run_info=$(gh api /repos/${{ github.repository }}/actions/runs/$run_id)
+            status=$(echo "$run_info" | jq -r '.status')
+            conclusion=$(echo "$run_info" | jq -r '.conclusion')
+            if [ "$status" == "completed" ] && [ "$conclusion" != "success" ]; then
+              echo "Rerunning failed jobs for run $run_id"
+              gh run rerun $run_id --failed
+              rerun_triggered=true
+            fi
+          done
+          echo "RERUN_TRIGGERED=$rerun_triggered" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.SENTINEL_TOKEN }}
+
+      - name: Exit if rerun triggered
+        if: steps.rerun.outputs.RERUN_TRIGGERED == 'true'
+        run: exit 0
+
+      - name: Trigger merge-tables workflow
+        if: steps.rerun.outputs.RERUN_TRIGGERED == 'false'
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: merge-tables.yml
+          token: ${{ secrets.SENTINEL_TOKEN }}

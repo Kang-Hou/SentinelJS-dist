@@ -1,0 +1,185 @@
+name: Process Tables
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_index:
+        description: 'Start index of tables to process'
+        required: true
+        default: '1'
+      batch_size:
+        description: 'Number of tables to process in this batch'
+        required: true
+        default: '250'
+
+env:
+  DB_USER: sentineljs
+  DB_NAME: sentineldb
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      total_tables: ${{ steps.get-table-count.outputs.total_tables }}
+      end_index: ${{ steps.set-matrix.outputs.end_index }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+    
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      - name: Download table count
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{secrets.SENTINEL_TOKEN}}
+          workflow: start-init-db.yml
+          name: table-count
+          path: .
+          check_artifacts: true
+          search_artifacts: true
+          if_no_artifact_found: fail
+          workflow_conclusion: success
+
+      - name: Get table count
+        id: get-table-count
+        run: |
+          total_tables=$(cat table_count.txt)
+          echo "total_tables=$total_tables" >> $GITHUB_OUTPUT
+
+      - name: Set matrix
+        id: set-matrix
+        run: |
+          start=${{ inputs.start_index }}
+          batch_size=${{ inputs.batch_size }}
+          total=${{ steps.get-table-count.outputs.total_tables }}
+          
+          echo "Start index: $start"
+          echo "Batch size: $batch_size"
+          echo "Total tables: $total"
+          
+          end=$((start + batch_size - 1))
+          if [ $end -gt $total ]; then
+            end=$total
+          fi
+          
+          echo "End index: $end"
+          
+          if [ $start -le $end ] && [ $start -le $total ]; then
+            matrix=$(seq -s ',' $start $end)
+          else
+            matrix="0"  # Fallback value to prevent empty matrix
+          fi
+          
+          echo "Generated matrix: $matrix"
+          
+          echo "matrix={\"table_index\":[${matrix}]}" >> $GITHUB_OUTPUT
+          echo "end_index=$end" >> $GITHUB_OUTPUT
+
+  process:
+    needs: prepare
+    if: needs.prepare.outputs.total_tables != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300   # fail in 300 minutes timeout restriction
+    strategy:
+      matrix: ${{fromJson(needs.prepare.outputs.matrix)}}
+      max-parallel: 20
+      fail-fast: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start Docker Compose services
+        run: docker compose up -d
+
+      # - name: Download sentineldb-executable
+      #   uses: dawidd6/action-download-artifact@v6
+      #   with:
+      #     github_token: ${{secrets.SENTINEL_TOKEN}}
+      #     workflow: build_sea.yml
+      #     name: sentineldb-executable
+      #     repo: Kang-Hou/SentinelDB
+      #     path: .
+      #     check_artifacts: true
+      #     search_artifacts: true
+      #     if_no_artifact_found: fail
+      #     workflow_conclusion: success
+
+      # - name: Make executable runnable
+      #   run: chmod +x ./sentineldb
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '21'
+          
+      - name: Clone private repository
+        run: |
+          git clone https://${{ secrets.SENTINEL_TOKEN }}@github.com/Kang-Hou/SentinelDB.git
+        
+      - name: Install dependencies and run script
+        run: |
+          cd SentinelDB
+          npm install
+          
+      - name: Download initial database
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{secrets.SENTINEL_TOKEN}}
+          workflow: start-init-db.yml
+          name: initial-database
+          path: .
+          check_artifacts: true
+          search_artifacts: true
+          if_no_artifact_found: warn
+          workflow_conclusion: success
+
+      - name: Restore initial database
+        run: |
+          if ! docker exec -i pg_container psql -U ${{ env.DB_USER }} -d ${{ env.DB_NAME }} < initial_db.sql; then
+            echo "Failed to restore initial database"
+            exit 1
+          fi
+
+      - name: Process Table
+        run: |
+          echo "Processing table ${{ matrix.table_index }}"
+          if node SentinelDB/index.js -c ${{ matrix.table_index }}; then
+            echo "Successfully processed table ${{ matrix.table_index }}"
+          else
+            echo "Failed to process table ${{ matrix.table_index }}"
+            exit 1
+          fi
+
+      - name: Export updated table
+        run: |
+          if ! docker exec pg_container pg_dump -U ${{ env.DB_USER }} -d ${{ env.DB_NAME }} -t cdnjs${{ matrix.table_index }} > updated_table_${{ matrix.table_index }}.sql; then
+            echo "Failed to export updated table ${{ matrix.table_index }}"
+            exit 1
+          fi
+
+      - name: Upload updated table
+        uses: actions/upload-artifact@v4
+        with:
+          name: updated-table-${{ matrix.table_index }}
+          path: updated_table_${{ matrix.table_index }}.sql
+          compression-level: 9
+          retention-days: 10
+
+  trigger_merge:
+    needs: [prepare, process]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger merge-tables workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: merge-tables.yml
+          token: ${{ secrets.SENTINEL_TOKEN }}
